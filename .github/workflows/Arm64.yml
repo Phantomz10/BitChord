@@ -1,0 +1,92 @@
+name: BitChord ARM64 Release APK
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64-release:
+    name: Build signed ARM64 APK
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+
+      - name: Configure signing and local properties
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64" || { echo 'KEYSTORE_BASE64 is missing'; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo 'KEYSTORE_PASSWORD is missing'; exit 1; }
+          test -n "$KEY_ALIAS" || { echo 'KEY_ALIAS is missing'; exit 1; }
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > bitchord-release.jks
+
+          # The keystore and its signing key intentionally use the same password.
+          printf '%s\n' \
+            'storeFile=bitchord-release.jks' \
+            "storePassword=$KEYSTORE_PASSWORD" \
+            "keyAlias=$KEY_ALIAS" \
+            "keyPassword=$KEYSTORE_PASSWORD" > keystore.properties
+
+          printf 'LASTFM_API_KEY=%s\nLASTFM_SECRET=%s\n' "$LASTFM_API_KEY" "$LASTFM_SECRET" > local.properties
+
+      - name: Force ARM64-only APK configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/include("armeabi-v7a", "arm64-v8a", "x86_64")/include("arm64-v8a")/' app/build.gradle.kts
+          sed -i 's/isUniversalApk = true/isUniversalApk = false/' app/build.gradle.kts
+          grep -A6 -B2 'splits {' app/build.gradle.kts
+
+      - name: Grant Gradle permission
+        run: chmod +x gradlew
+
+      - name: Build signed ARM64 release
+        run: ./gradlew --no-daemon assembleProdRelease
+
+      - name: Verify exactly one ARM64 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find app/build/outputs/apk -type f -name '*.apk' -print)
+
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "Expected exactly one APK, found ${#apks[@]}:"
+            printf '%s\n' "${apks[@]}"
+            exit 1
+          fi
+
+          apk="${apks[0]}"
+          case "$apk" in
+            *arm64-v8a*.apk) ;;
+            *)
+              echo "The generated APK is not the ARM64 split: $apk"
+              exit 1
+              ;;
+          esac
+
+          mkdir -p dist
+          cp "$apk" dist/BitChord-1.7.1-arm64-v8a.apk
+          ls -lh dist/BitChord-1.7.1-arm64-v8a.apk
+
+      - name: Upload final APK only
+        uses: actions/upload-artifact@v4
+        with:
+          name: BitChord-1.7.1-arm64-v8a
+          path: dist/BitChord-1.7.1-arm64-v8a.apk
+          if-no-files-found: error
+          compression-level: 0
