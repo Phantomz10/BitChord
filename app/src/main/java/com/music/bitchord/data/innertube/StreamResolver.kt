@@ -645,14 +645,33 @@ object StreamResolver {
             if (found == null) TrackLog.w(TAG, "InnerTubeX found no usable $format for $videoId; extracting")
             runCatching {
                 newPipeStream(videoId) { candidates ->
-                    // Capped the same way as the player-response selection, off
-                    // the same setting, or the failsafe would quietly hand back
-                    // a rendition the user said they didn't want to keep.
-                    val matching = candidates.filter {
-                        if (requireM4a) it.second.isM4a else it.second.isWebmOpus
+                    // Prefer Opus/WebM for normal downloads, but do not assume
+                    // every YouTube track exposes an Opus progressive stream.
+                    // Some tracks only expose AAC/M4A as a direct progressive
+                    // download. In that case the old code discarded every M4A
+                    // candidate and ended with "No downloadable audio" even
+                    // though NewPipe had a perfectly usable audio file URL.
+                    //
+                    // When M4A is explicitly required, keep the old strict
+                    // behaviour. Otherwise prefer WebM/Opus, then fall back to
+                    // M4A, and finally to any direct progressive audio stream
+                    // that BitChord can save as m4a/webm.
+                    val preferred = if (requireM4a) {
+                        candidates.filter { it.second.isM4a }
+                    } else {
+                        val opus = candidates.filter { it.second.isWebmOpus }
+                        val m4a = candidates.filter { it.second.isM4a }
+                        if (opus.isNotEmpty()) opus else m4a
                     }
-                    underCeiling(matching, maxKbps)
+
+                    underCeiling(preferred, maxKbps)
                         ?.also { offered = true }
+                        ?: if (!requireM4a) {
+                            underCeiling(candidates, maxKbps)
+                                ?.also { offered = true }
+                        } else {
+                            null
+                        }
                 }
             }.onSuccess { return@withContext it }
                 .onFailure { TrackLog.w(TAG, "extraction found no $format for $videoId: ${it.message}") }
@@ -1000,14 +1019,38 @@ object StreamResolver {
                 "https://www.youtube.com/watch?v=$videoId",
             )
             extractor.fetchPage()
-            val candidates = extractor.audioStreams
-                // Progressive only — DASH/HLS entries carry a manifest, not a URL.
-                .filter {
-                    !it.content.isNullOrBlank() &&
-                        it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP
-                }
+            val allAudioStreams = extractor.audioStreams
+
+            // NewPipe can expose DASH/HLS entries as well as direct progressive
+            // HTTP streams. Only progressive streams can be handed directly to
+            // BitChord's downloader; a DASH/HLS entry is a manifest rather than
+            // an audio file URL. Keep the filter, but log what was rejected so a
+            // track-specific failure is diagnosable instead of looking like the
+            // track simply has no audio.
+            allAudioStreams.forEach { audio ->
+                TrackLog.d(
+                    TAG,
+                    "NewPipe audio: format=${audio.format?.name}, " +
+                        "bitrate=${audio.averageBitrate}kbps, " +
+                        "delivery=${audio.deliveryMethod}, " +
+                        "hasUrl=${!audio.content.isNullOrBlank()}"
+                )
+            }
+
+            val candidates = allAudioStreams.filter {
+                !it.content.isNullOrBlank() &&
+                    it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP
+            }
+
+            if (candidates.isEmpty()) {
+                error(
+                    "Track unavailable: NewPipe returned ${allAudioStreams.size} " +
+                        "audio streams, but none are direct progressive downloads"
+                )
+            }
+
             val stream = select(candidates.map { it.averageBitrate to it })
-                ?: error("Track unavailable: no audio streams")
+                ?: error("Track unavailable: no compatible audio stream")
             TrackLog.d(
                 TAG,
                 "NewPipe picked ${stream.format?.name} @ ${stream.averageBitrate}kbps " +
